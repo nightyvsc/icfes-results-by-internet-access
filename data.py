@@ -13,6 +13,12 @@ Variables de entorno:
   SPARK_EXECUTOR_MEMORY      Solo clúster. Por defecto: 8g (VMs con 12 GB RAM).
   SPARK_DEFAULT_PARALLELISM  Por defecto: executor_instances * executor_cores en clúster;
                         en local, omite o usa el paralelismo por defecto de Spark.
+
+  SPARK_HOME_USE_SYSTEM    Si es 1/true, no se ajusta SPARK_HOME (usa el del entorno).
+                        Por defecto se alinea con el pyspark del venv para evitar el error
+                        TypeError: 'JavaPackage' object is not callable (mezcla pip + tarball).
+
+  PySpark 4.x requiere Java 17 o 21 (comprueba: java -version y JAVA_HOME).
 """
 
 import argparse
@@ -21,6 +27,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+
+import pyspark
 from pyspark.sql import SparkSession
 
 DATASETS = {
@@ -119,6 +127,21 @@ def _spark_local_driver_memory() -> str:
     return os.environ.get("SPARK_DRIVER_MEMORY", "2g")
 
 
+def _align_spark_home_with_pyspark_package() -> None:
+    """
+    Si SPARK_HOME apunta a otra instalación de Spark que la de este intérprete,
+    el driver JVM carga jars distintos a los del paquete pip y aparece
+    'JavaPackage' object is not callable al crear SparkSession.
+    """
+    use_system = os.environ.get("SPARK_HOME_USE_SYSTEM", "").strip().lower()
+    if use_system in ("1", "true", "yes"):
+        return
+    pkg_dir = os.path.dirname(os.path.abspath(pyspark.__file__))
+    if not os.path.isdir(os.path.join(pkg_dir, "jars")):
+        return
+    os.environ["SPARK_HOME"] = pkg_dir
+
+
 def _build_spark_session() -> SparkSession:
     master_url = os.environ.get("SPARK_MASTER_URL", "").strip()
     app_name = "Ingesta_Datos_ICFES_Internet_GovCO"
@@ -156,7 +179,19 @@ def _build_spark_session() -> SparkSession:
         print(f"\nModo local: master=local[*], driver.memory={driver_mem}")
         builder = builder.master("local[*]").config("spark.driver.memory", driver_mem)
 
-    return builder.getOrCreate()
+    _align_spark_home_with_pyspark_package()
+    try:
+        return builder.getOrCreate()
+    except TypeError as e:
+        if "JavaPackage" in str(e):
+            raise SystemExit(
+                "Fallo al iniciar Spark (JavaPackage): suele ser Java incompatible o "
+                "SPARK_HOME mezclando la instalación del curso con pyspark de pip.\n"
+                "- Usa Java 17 o 21 para PySpark 4.x (export JAVA_HOME=...).\n"
+                "- O export SPARK_HOME_USE_SYSTEM=1 si quieres forzar solo el Spark del sistema "
+                "(y alinea la versión pip con esa instalación, o usa el Python de SPARK_HOME)."
+            ) from e
+        raise
 
 
 def process_with_spark() -> None:
