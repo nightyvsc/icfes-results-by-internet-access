@@ -58,7 +58,7 @@ def get_app_token() -> str:
     return token
 
 
-def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, sample: int | None = None) -> None:
+def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, sample=None) -> None:
     headers = {"X-App-Token": app_token}
     print(f"\n--- Procesando dataset: {dataset_name} ({dataset_id}) ---")
     api_url = f"https://www.datos.gov.co/resource/{dataset_id}.json"
@@ -110,7 +110,7 @@ def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, sam
         print(f"[{dataset_name}] Modo muestra: {total_fetched}/{sample} registros obtenidos.")
 
 
-def extract_data_to_disk(*, parallel_datasets: bool, sample: int | None = None) -> None:
+def extract_data_to_disk(*, parallel_datasets: bool, sample=None) -> None:
     app_token = get_app_token()
     if sample is not None:
         print(f"Iniciando extraccion en modo muestra ({sample} registros por dataset)...")
