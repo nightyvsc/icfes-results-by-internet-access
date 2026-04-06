@@ -26,6 +26,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
 import requests
 
 import pyspark
@@ -34,6 +35,7 @@ from pyspark.sql import SparkSession
 DATASETS = {
     "icfes": "n48w-gutb",
     "internet": "hk5x-635y",
+    "bachiderato": "nudc-7mev",
 }
 
 TOKEN_ENV = "SOCRATA_APP_TOKEN"
