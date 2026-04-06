@@ -58,7 +58,7 @@ def get_app_token() -> str:
     return token
 
 
-def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str) -> None:
+def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, sample: int | None = None) -> None:
     headers = {"X-App-Token": app_token}
     print(f"\n--- Procesando dataset: {dataset_name} ({dataset_id}) ---")
     api_url = f"https://www.datos.gov.co/resource/{dataset_id}.json"
@@ -67,11 +67,20 @@ def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str) -> 
 
     offset = 0
     chunk_idx = 0
+    total_fetched = 0
 
     while True:
-        print(f"[{dataset_name}] -> Pidiendo lote desde el offset {offset}...")
+        if sample is not None:
+            remaining = sample - total_fetched
+            if remaining <= 0:
+                break
+            batch_size = min(LIMIT, remaining)
+        else:
+            batch_size = LIMIT
+
+        print(f"[{dataset_name}] -> Pidiendo lote desde el offset {offset} (batch_size={batch_size})...")
         params = {
-            "$limit": LIMIT,
+            "$limit": batch_size,
             "$offset": offset,
             "$order": ":id",
         }
@@ -88,23 +97,25 @@ def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str) -> 
             for record in data:
                 f.write(json.dumps(record) + "\n")
 
-        print(f"[{dataset_name}]    Guardado: {file_path} ({len(data)} registros)")
+        total_fetched += len(data)
+        print(f"[{dataset_name}]    Guardado: {file_path} ({len(data)} registros, total={total_fetched})")
 
-        if len(data) < LIMIT:
+        if len(data) < batch_size:
             break
 
-        offset += LIMIT
+        offset += batch_size
         chunk_idx += 1
 
+    if sample is not None:
+        print(f"[{dataset_name}] Modo muestra: {total_fetched}/{sample} registros obtenidos.")
 
-def extract_data_to_disk(*, parallel_datasets: bool) -> None:
-    """
-    Descarga por la API Socrata con paginación secuencial por dataset.
-    Si parallel_datasets es True, cada dataset corre en su propio hilo (misma API,
-    más carga concurrente; uso responsable recomendado).
-    """
+
+def extract_data_to_disk(*, parallel_datasets: bool, sample: int | None = None) -> None:
     app_token = get_app_token()
-    print("Iniciando la extracción estructurada desde datos.gov.co...")
+    if sample is not None:
+        print(f"Iniciando extraccion en modo muestra ({sample} registros por dataset)...")
+    else:
+        print("Iniciando la extraccion estructurada desde datos.gov.co...")
 
     items = list(DATASETS.items())
 
@@ -113,17 +124,16 @@ def extract_data_to_disk(*, parallel_datasets: bool) -> None:
         print(f"Descarga paralela entre datasets (hasta {workers} hilos).")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(_extract_one_dataset, name, did, app_token): name
+                ex.submit(_extract_one_dataset, name, did, app_token, sample): name
                 for name, did in items
             }
             for fut in as_completed(futures):
-                name = futures[fut]
                 fut.result()
     else:
         for dataset_name, dataset_id in items:
-            _extract_one_dataset(dataset_name, dataset_id, app_token)
+            _extract_one_dataset(dataset_name, dataset_id, app_token, sample)
 
-    print("\n====== Extracción API completada para todos los datasets ======")
+    print("\n====== Extraccion API completada para todos los datasets ======")
 
 
 def _spark_local_driver_memory() -> str:
@@ -248,6 +258,13 @@ def main() -> None:
         action="store_true",
         help="Descargar varios datasets a la vez (paginación sigue siendo secuencial por dataset).",
     )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Descargar solo los primeros N registros por dataset (modo desarrollo).",
+)
     args = parser.parse_args()
 
     if args.extract_only and args.spark_only:
@@ -257,7 +274,8 @@ def main() -> None:
     run_spark = args.spark_only or not args.extract_only
 
     if run_extract:
-        extract_data_to_disk(parallel_datasets=args.parallel_downloads)
+        extract_data_to_disk(parallel_datasets=args.parallel_downloads, sample=args.sample)
+
     if run_spark:
         process_with_spark()
 

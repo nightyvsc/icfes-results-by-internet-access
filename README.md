@@ -97,6 +97,21 @@ Downloads the `.jsonl` files to `data/raw_json/` without running Spark:
 ```bash
 python3 data.py --extract-only
 ```
+### Sample mode (development)
+
+Downloads only the first N records per dataset, without running Spark. Useful for testing the pipeline locally without access to the cluster or the full dataset:
+```bash
+python3 data.py --sample 5000
+```
+Can be used together with `--extract-only`:
+```bash
+python3 data.py --extract-only --sample 5000
+```
+
+Can be combined with `--parallel-downloads`:
+```bash
+python3 data.py --extract-only --sample 5000 --parallel-downloads
+```
 
 ### Spark processing only
 
