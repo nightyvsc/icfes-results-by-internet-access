@@ -33,10 +33,9 @@ import pyspark
 from pyspark.sql import SparkSession
 
 DATASETS = {
-    "icfes": "kgxf-xxbe",        # Resultados únicos Saber 11 (histórico)
-    "internet": "n48w-gutb",     # Accesos internet por municipio
-    "bachillerato": "nudc-7mev", # Cobertura educativa por municipio
-    "pobreza": "gb6q-tu7m",
+    "icfes": "kgxf-xxbe",
+    "internet": "n48w-gutb",
+    "bachillerato": "nudc-7mev",
 }
 
 TOKEN_ENV = "SOCRATA_APP_TOKEN"
