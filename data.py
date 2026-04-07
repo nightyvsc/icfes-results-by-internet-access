@@ -39,7 +39,7 @@ DATASETS = {
 }
 
 TOKEN_ENV = "SOCRATA_APP_TOKEN"
-LIMIT = 50000
+LIMIT = 5000
 RAW_DIR = "data/raw_json"
 PARQUET_DIR = "data/parquet"
 
