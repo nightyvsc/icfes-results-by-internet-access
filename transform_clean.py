@@ -53,6 +53,25 @@ BACH_NUM_COLS = [
     "tama_o_promedio_de_grupo",
 ]
 
+# Columnas necesarias por dataset (evita cargar 80+ cols → fix Janino 64 KB)
+ICFES_REQUIRED_COLS = ICFES_SCORE_COLS + [
+    "cole_cod_mcpio_ubicacion",
+    "periodo",
+    "estu_estadoinvestigacion",
+]
+
+INTERNET_REQUIRED_COLS = INTERNET_NUM_COLS + [
+    "cod_municipio",
+    "anno",
+]
+
+BACH_REQUIRED_COLS = BACH_NUM_COLS + [
+    "c_digo_municipio",
+    "a_o",
+    "municipio",
+    "departamento",
+]
+
 
 def _quiet_log4j_options() -> str | None:
     """Java system property so Spark uses project quiet-log4j2.properties (less stdout/stderr noise)."""
@@ -95,6 +114,7 @@ def build_spark_session() -> SparkSession:
         builder.config("spark.ui.showConsoleProgress", "false")
         .config("spark.logConf", "false")
         .config("spark.sql.debug.maxToStringFields", "8")
+        .config("spark.sql.codegen.wholeStage", "false")
     )
     if quiet_java:
         builder = builder.config("spark.driver.extraJavaOptions", quiet_java)
@@ -219,7 +239,7 @@ def prepare_icfes(df: DataFrame) -> DataFrame:
     # Filtro: solo estudiantes con resultados publicados (excluye investigación / pendientes).
     if "estu_estadoinvestigacion" in out.columns:
         st = F.upper(F.trim(F.col("estu_estadoinvestigacion").cast(StringType())))
-        out = out.filter(st == "PUBLICADO")
+        out = out.filter(st == "PUBLICAR")
 
     out = out.filter(F.col("cod_municipio_norm").isNotNull())
 
@@ -396,6 +416,17 @@ def run_pipeline(
     base_icfes = spark.read.parquet(os.path.join(parquet_dir, "icfes"))
     base_internet = spark.read.parquet(os.path.join(parquet_dir, "internet"))
     base_bach = spark.read.parquet(os.path.join(parquet_dir, "bachillerato"))
+
+    # Seleccionar solo columnas necesarias (fix Janino 64 KB codegen limit)
+    base_icfes = base_icfes.select(
+        *[c for c in ICFES_REQUIRED_COLS if c in base_icfes.columns]
+    )
+    base_internet = base_internet.select(
+        *[c for c in INTERNET_REQUIRED_COLS if c in base_internet.columns]
+    )
+    base_bach = base_bach.select(
+        *[c for c in BACH_REQUIRED_COLS if c in base_bach.columns]
+    )
 
     if limit_rows is not None:
         base_icfes = base_icfes.limit(limit_rows)

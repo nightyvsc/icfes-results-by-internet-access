@@ -1,6 +1,9 @@
 """
 Ingesta desde datos.gov.co (Socrata) y conversión a Parquet con PySpark.
 
+Descarga registros desde la API de Socrata en páginas de 5,000 (LIMIT) y los agrupa
+en archivos HDFS de ~80,000 registros (RECORDS_PER_FILE ≈ 128 MB) cada uno.
+
 Variables de entorno:
   SOCRATA_APP_TOKEN     Obligatoria para la extracción. Token de aplicación Socrata.
 
@@ -18,16 +21,20 @@ Variables de entorno:
                         Por defecto se alinea con el pyspark del venv para evitar el error
                         TypeError: 'JavaPackage' object is not callable (mezcla pip + tarball).
 
-  PySpark 4.x requiere Java 17 o 21 (comprueba: java -version y JAVA_HOME).
+  PySpark 3.5.x requiere Java 11 (comprueba: java -version y JAVA_HOME).
 """
 
 import argparse
 import json
+import math
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import pyspark
 from pyspark.sql import SparkSession
@@ -40,11 +47,29 @@ DATASETS = {
 
 TOKEN_ENV = "SOCRATA_APP_TOKEN"
 LIMIT = 5000
-RAW_DIR = "data/raw_json"
-PARQUET_DIR = "data/parquet"
+MAX_RETRIES = 5
+RETRY_BACKOFF_BASE = 5  # seconds: 5, 10, 20, 40, 80
 
-# Tope de hilos al bajar varios datasets en paralelo (entre datasets, no entre páginas)
-MAX_PARALLEL_DATASET_DOWNLOADS = 3
+# Se usará la URL del HDFS para lecturas y descargas directas WebHDFS
+HDFS_URI = "hdfs://spark-worker1:9000"
+WEBHDFS_URL = "http://spark-worker1:9870"
+PARQUET_DIR = f"{HDFS_URI}/data/parquet"
+
+
+def _build_http_session(app_token: str) -> requests.Session:
+    """Crea una sesión HTTP con reintentos automáticos y backoff exponencial."""
+    session = requests.Session()
+    session.headers.update({"X-App-Token": app_token})
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def get_app_token() -> str:
@@ -57,82 +82,132 @@ def get_app_token() -> str:
     return token
 
 
-def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, sample=None) -> None:
-    headers = {"X-App-Token": app_token}
+def _get_existing_parts(hdfs_client, dataset_raw_hdfs_dir: str) -> set:
+    """Escanea HDFS y retorna los índices de partes ya descargadas."""
+    existing = set()
+    try:
+        files = hdfs_client.list(dataset_raw_hdfs_dir, status=False)
+        for fname in files:
+            # Formato: part_0000.jsonl -> extraer el índice 0
+            if fname.startswith("part_") and fname.endswith(".jsonl"):
+                try:
+                    idx = int(fname.replace("part_", "").replace(".jsonl", ""))
+                    existing.add(idx)
+                except ValueError:
+                    pass
+    except Exception:
+        pass  # Directorio no existe aún
+    return existing
+
+
+def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, parallel_downloads: bool, sample=None) -> None:
+    from hdfs import InsecureClient
+    http_session = _build_http_session(app_token)
     print(f"\n--- Procesando dataset: {dataset_name} ({dataset_id}) ---")
     api_url = f"https://www.datos.gov.co/resource/{dataset_id}.json"
-    dataset_raw_dir = os.path.join(RAW_DIR, dataset_name)
-    os.makedirs(dataset_raw_dir, exist_ok=True)
 
-    offset = 0
-    chunk_idx = 0
-    total_fetched = 0
+    # Cliente WebHDFS
+    hdfs_client = InsecureClient(WEBHDFS_URL)
+    dataset_raw_hdfs_dir = f"/data/raw_json/{dataset_name}"
 
-    while True:
-        if sample is not None:
-            remaining = sample - total_fetched
-            if remaining <= 0:
-                break
-            batch_size = min(LIMIT, remaining)
-        else:
-            batch_size = LIMIT
+    # Crear directorio si no existe (NO borrar datos previos para permitir reanudación)
+    hdfs_client.makedirs(dataset_raw_hdfs_dir)
 
-        print(f"[{dataset_name}] -> Pidiendo lote desde el offset {offset} (batch_size={batch_size})...")
-        params = {
-            "$limit": batch_size,
-            "$offset": offset,
-            "$order": ":id",
-        }
-        response = requests.get(api_url, headers=headers, params=params, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-
-        if not data:
-            print(f"[{dataset_name}] Fin del dataset (lote vacío).")
-            break
-
-        file_path = os.path.join(dataset_raw_dir, f"part_{chunk_idx:04d}.jsonl")
-        with open(file_path, "w", encoding="utf-8") as f:
-            for record in data:
-                f.write(json.dumps(record) + "\n")
-
-        total_fetched += len(data)
-        print(f"[{dataset_name}]    Guardado: {file_path} ({len(data)} registros, total={total_fetched})")
-
-        if len(data) < batch_size:
-            break
-
-        offset += batch_size
-        chunk_idx += 1
-
+    total_records = 0
     if sample is not None:
-        print(f"[{dataset_name}] Modo muestra: {total_fetched}/{sample} registros obtenidos.")
+        total_records = sample
+        print(f"[{dataset_name}] Modo muestra activado: Limitado a {sample} registros.")
+    else:
+        print(f"[{dataset_name}] Determinando tamaño total del dataset en Socrata...")
+        count_url = f"{api_url}?$select=count(*)"
+        resp = http_session.get(count_url, timeout=60)
+        resp.raise_for_status()
+        total_records = int(resp.json()[0]["count"])
+        print(f"[{dataset_name}] Registros totales estimados: {total_records}")
+
+    if total_records == 0:
+        print(f"[{dataset_name}] No hay datos en el dataset.")
+        return
+
+    offsets = list(range(0, total_records, LIMIT))
+
+    # Detectar partes ya descargadas para reanudar
+    existing_parts = _get_existing_parts(hdfs_client, dataset_raw_hdfs_dir)
+    if existing_parts:
+        print(f"[{dataset_name}] Reanudando: {len(existing_parts)}/{len(offsets)} lotes ya existen en HDFS, se omitirán.")
+
+    def download_chunk(offset_tuple):
+        chunk_idx, offset = offset_tuple
+
+        # Saltar si ya existe en HDFS
+        if chunk_idx in existing_parts:
+            return 0
+
+        remaining = total_records - offset
+        batch_size = min(LIMIT, remaining)
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"[{dataset_name}] -> Pidiendo lote {chunk_idx:04d} (offset={offset}, batch_size={batch_size})...")
+                params = {
+                    "$limit": batch_size,
+                    "$offset": offset,
+                    "$order": ":id",
+                }
+                res = http_session.get(api_url, params=params, timeout=120)
+                res.raise_for_status()
+                data = res.json()
+
+                if not data:
+                    return 0
+
+                # Guardar en HDFS via WebHDFS (zero local disk footprint)
+                hdfs_path = f"{dataset_raw_hdfs_dir}/part_{chunk_idx:04d}.jsonl"
+                with hdfs_client.write(hdfs_path, encoding="utf-8") as writer:
+                    for record in data:
+                        writer.write(json.dumps(record) + "\n")
+
+                return len(data)
+
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                print(f"[{dataset_name}] ⚠ Lote {chunk_idx:04d} falló (intento {attempt}/{MAX_RETRIES}): {type(e).__name__}. Reintentando en {wait}s...")
+                time.sleep(wait)
+
+        raise RuntimeError(f"[{dataset_name}] Lote {chunk_idx:04d} falló tras {MAX_RETRIES} intentos.")
+
+    total_fetched = 0
+    pending = [(idx, off) for idx, off in enumerate(offsets) if idx not in existing_parts]
+    print(f"[{dataset_name}] Lotes pendientes: {len(pending)} de {len(offsets)} totales.")
+
+    if parallel_downloads:
+        workers = min(10, len(pending))
+        print(f"[{dataset_name}] Descarga concurrente ({workers} hilos).")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(download_chunk, (idx, off)): idx for idx, off in pending}
+            for fut in as_completed(futures):
+                total_fetched += fut.result()
+    else:
+        for idx, off in pending:
+            total_fetched += download_chunk((idx, off))
+
+    skipped = len(existing_parts)
+    print(f"[{dataset_name}] Fin. Descargados {total_fetched} registros nuevos ({skipped} lotes reutilizados de HDFS).")
 
 
-def extract_data_to_disk(*, parallel_datasets: bool, sample=None) -> None:
+def extract_data_to_hdfs(*, parallel_downloads: bool, sample=None) -> None:
     app_token = get_app_token()
     if sample is not None:
-        print(f"Iniciando extraccion en modo muestra ({sample} registros por dataset)...")
+        print(f"Iniciando extraccion en modo muestra hacia HDFS ({sample} registros por dataset)...")
     else:
-        print("Iniciando la extraccion estructurada desde datos.gov.co...")
+        print("Iniciando la extraccion estructurada desde datos.gov.co directo a HDFS...")
 
-    items = list(DATASETS.items())
+    for dataset_name, dataset_id in DATASETS.items():
+        _extract_one_dataset(dataset_name, dataset_id, app_token, parallel_downloads, sample)
 
-    if parallel_datasets and len(items) > 1:
-        workers = min(len(items), MAX_PARALLEL_DATASET_DOWNLOADS)
-        print(f"Descarga paralela entre datasets (hasta {workers} hilos).")
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {
-                ex.submit(_extract_one_dataset, name, did, app_token, sample): name
-                for name, did in items
-            }
-            for fut in as_completed(futures):
-                fut.result()
-    else:
-        for dataset_name, dataset_id in items:
-            _extract_one_dataset(dataset_name, dataset_id, app_token, sample)
-
-    print("\n====== Extraccion API completada para todos los datasets ======")
+    print("\n====== Extraccion API hacia HDFS completada ======")
 
 
 def _spark_local_driver_memory() -> str:
@@ -208,15 +283,19 @@ def _build_spark_session() -> SparkSession:
 
 def process_with_spark() -> None:
     """
-    Lee los .jsonl del directorio crudo y escribe Parquet.
+    Lee los .jsonl distribuidos en HDFS y escribe Parquet borrando crudos despues.
     """
     print("\nIniciando sesión de Spark...")
     spark = _build_spark_session()
 
     try:
+        sc = spark.sparkContext
+        Path = sc._gateway.jvm.org.apache.hadoop.fs.Path
+        fs = Path(f"{HDFS_URI}/").getFileSystem(sc._jsc.hadoopConfiguration())
+
         for dataset_name in DATASETS:
-            dataset_raw_dir = os.path.join(RAW_DIR, dataset_name)
-            dataset_parquet_dir = os.path.join(PARQUET_DIR, dataset_name)
+            dataset_raw_dir = f"{HDFS_URI}/data/raw_json/{dataset_name}"
+            dataset_parquet_dir = f"{HDFS_URI}/data/parquet/{dataset_name}"
 
             print(f"\nLeyendo archivos crudos desde '{dataset_raw_dir}' ...")
             df = spark.read.json(dataset_raw_dir)
@@ -227,10 +306,17 @@ def process_with_spark() -> None:
             total_rows = df.count()
             print(f"\nResumen: Total de registros para '{dataset_name}': {total_rows}")
 
-            print(f"Guardando Parquet en '{dataset_parquet_dir}' ...")
+            print(f"Guardando Parquet distribuido en '{dataset_parquet_dir}' ...")
             df.write.mode("overwrite").parquet(dataset_parquet_dir)
 
-        print("\n====== Ingesta a Spark completada exitosamente ======")
+            # Auto-borrado de crudos en HDFS usando la JVM via Py4J
+            print(f"Limpiando capa cruda JSON: borrando {dataset_raw_dir} ...")
+            try:
+                fs.delete(Path(dataset_raw_dir), True)
+            except Exception as jvm_err:
+                print(f"Advertencia: no se pudo borrar el raw JSON para {dataset_name}: {jvm_err}")
+
+        print("\n====== Transformación a Parquet distribuido completada ======")
     except Exception as e:
         print(f"Error procesando con Spark: {str(e)}")
         raise
@@ -273,7 +359,7 @@ def main() -> None:
     run_spark = args.spark_only or not args.extract_only
 
     if run_extract:
-        extract_data_to_disk(parallel_datasets=args.parallel_downloads, sample=args.sample)
+        extract_data_to_hdfs(parallel_downloads=args.parallel_downloads, sample=args.sample)
 
     if run_spark:
         process_with_spark()
