@@ -58,11 +58,21 @@ ICFES_REQUIRED_COLS = ICFES_SCORE_COLS + [
     "cole_cod_mcpio_ubicacion",
     "periodo",
     "estu_estadoinvestigacion",
+    # NUEVAS: requeridas para Filtro-1 (privados de libertad) y
+    # Transformación-1 (flag_internet_hogar / pregunta 2) y pregunta 8
+    "estu_privado_libertad",
+    "fami_tieneinternet",
+    "cole_area_ubicacion",
+    "cole_naturaleza",
 ]
 
 INTERNET_REQUIRED_COLS = INTERNET_NUM_COLS + [
     "cod_municipio",
     "anno",
+    # NUEVAS: requeridas para Filtro-2 (residencial) y Transformación-2
+    # (categoría velocidad / pregunta 3)
+    "segmento",
+    "tecnologia",
 ]
 
 BACH_REQUIRED_COLS = BACH_NUM_COLS + [
@@ -241,6 +251,19 @@ def prepare_icfes(df: DataFrame) -> DataFrame:
         st = F.upper(F.trim(F.col("estu_estadoinvestigacion").cast(StringType())))
         out = out.filter(st == "PUBLICAR")
 
+    # ──────────────────────────────────────────────────────────────────────
+    # FILTRO 1 (nuevo): Excluir estudiantes privados de libertad.
+    # Justificación: Las preguntas 2, 4, 7 y 8 analizan la relación entre
+    # acceso a internet en el hogar y resultados Saber 11, y brechas
+    # urbano-rural y oficial/no-oficial. Los estudiantes privados de libertad
+    # tienen condiciones de acceso a internet radicalmente distintas (sin
+    # hogar familiar activo) que sesgarían el análisis comparativo de
+    # conectividad-desempeño y la variable fami_tieneinternet.
+    # ──────────────────────────────────────────────────────────────────────
+    if "estu_privado_libertad" in out.columns:
+        pl = F.upper(F.trim(F.col("estu_privado_libertad").cast(StringType())))
+        out = out.filter((pl != "S") | pl.isNull())
+
     out = out.filter(F.col("cod_municipio_norm").isNotNull())
 
     # Puntajes Saber 11 ~0–500; eliminar filas fuera de rango (datos alterados).
@@ -253,6 +276,26 @@ def prepare_icfes(df: DataFrame) -> DataFrame:
     # Atípicos por IQR sobre punt_global (avance metodológico; entrega 2 puede refinar).
     if "punt_global" in out.columns:
         out = apply_iqr_filter(out, "punt_global")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 1 (nueva): flag_internet_hogar → columna binaria 0/1.
+    # Convierte fami_tieneinternet (Si / No / null) a entero para habilitar
+    # correlaciones y regresiones directas sobre el acceso doméstico.
+    # Justificación: La pregunta 2 requiere cuantificar la asociación entre
+    # tener internet en casa y el puntaje global; una variable categórica
+    # impide calcular correlaciones de Pearson/Spearman y usarla como
+    # predictor numérico. Con 0/1 también se puede calcular la tasa de
+    # penetración doméstica por municipio (mean), necesaria para las
+    # comparaciones de conectividad de preguntas 1, 4 y 8.
+    # ──────────────────────────────────────────────────────────────────────
+    if "fami_tieneinternet" in out.columns:
+        inet_str = F.upper(F.trim(F.col("fami_tieneinternet").cast(StringType())))
+        out = out.withColumn(
+            "flag_internet_hogar",
+            F.when(inet_str == "SI", F.lit(1))
+             .when(inet_str == "NO", F.lit(0))
+             .otherwise(F.lit(None).cast(IntegerType())),
+        )
 
     # Imputación por media: punt_ingles (ejemplo tipo PDF) — solo donde sigue null.
     if "punt_ingles" in out.columns:
@@ -292,6 +335,41 @@ def prepare_internet(df: DataFrame) -> DataFrame:
 
     if "no_de_accesos" in out.columns:
         out = apply_iqr_filter(out, "no_de_accesos")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FILTRO 2 (nuevo): Conservar solo registros del segmento residencial.
+    # Justificación: Las preguntas 1, 2, 3, 4 y 7 analizan la conectividad
+    # doméstica (hogar del estudiante) y su impacto en resultados Saber 11.
+    # El segmento corporativo (empresas) no representa el acceso del hogar
+    # del estudiante y distorsiona métricas como accesos_por_habitante y la
+    # correlación con fami_tieneinternet. Filtrar a "residencial" (estratos
+    # 1-6) garantiza que los accesos agregados por municipio reflejen la
+    # penetración hogareña real, que es el eje de todas las preguntas de
+    # negocio.
+    # ──────────────────────────────────────────────────────────────────────
+    if "segmento" in out.columns:
+        seg = F.lower(F.trim(F.col("segmento").cast(StringType())))
+        out = out.filter(seg.contains("residencial") | seg.isNull())
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 2 (nueva): categoria_velocidad_bajada
+    # Clasifica la velocidad de descarga en tres rangos estándar UIT-T
+    # (baja < 10 Mbps | media 10-100 Mbps | alta > 100 Mbps).
+    # Justificación: La pregunta 3 pregunta qué tecnologías predominan en
+    # municipios con mejor/peor desempeño y si existe relación con la
+    # velocidad. Una variable continua es difícil de comparar entre grupos
+    # de municipios; la categoría permite hacer tablas de contingencia
+    # tecnología × velocidad × desempeño, y es la clasificación usada por
+    # la OCDE y MinTIC para reportes de banda ancha.
+    # ──────────────────────────────────────────────────────────────────────
+    if "velocidad_bajada" in out.columns:
+        out = out.withColumn(
+            "categoria_velocidad_bajada",
+            F.when(F.col("velocidad_bajada").isNull(), F.lit(None).cast(StringType()))
+             .when(F.col("velocidad_bajada") < 10,  F.lit("baja"))
+             .when(F.col("velocidad_bajada") <= 100, F.lit("media"))
+             .otherwise(F.lit("alta")),
+        )
 
     return out
 
@@ -381,6 +459,36 @@ def build_municipio_internet_cobertura(
             F.col("total_accesos_internet") / F.col("poblaci_n_5_16"),
         ).otherwise(None),
     )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 3 (nueva): nivel_conectividad_municipio
+    # Clasifica cada municipio en "alta", "media" o "baja" conectividad
+    # usando terciles de accesos_por_habitante (cortes al percentil 33 y 66).
+    # Justificación: Las preguntas 1, 4, 6 y 7 comparan explícitamente
+    # municipios con "alta y baja cobertura de internet". Sin esta variable
+    # categórica habría que recalcular los cortes en cada análisis posterior.
+    # Se usan terciles (33-66) en lugar de mediana porque permiten distinguir
+    # un grupo intermedio que revela patrones de desempeño no lineales; es
+    # la estratificación recomendada por el DNP en informes de brechas
+    # digitales territoriales. La columna se calcula una sola vez aquí y
+    # quedará disponible en el Parquet de municipio_internet_cobertura.
+    # ──────────────────────────────────────────────────────────────────────
+    col_aph = "accesos_por_habitante"
+    qs_aph = joined.approxQuantile(col_aph, [0.33, 0.66], relativeError=0.01)
+    if qs_aph and qs_aph[0] is not None and qs_aph[1] is not None:
+        p33, p66 = float(qs_aph[0]), float(qs_aph[1])
+        joined = joined.withColumn(
+            "nivel_conectividad_municipio",
+            F.when(F.col(col_aph).isNull(), F.lit(None).cast(StringType()))
+             .when(F.col(col_aph) <= p33, F.lit("baja"))
+             .when(F.col(col_aph) <= p66, F.lit("media"))
+             .otherwise(F.lit("alta")),
+        )
+    else:
+        joined = joined.withColumn(
+            "nivel_conectividad_municipio", F.lit(None).cast(StringType())
+        )
+
     return joined
 
 
