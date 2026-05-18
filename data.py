@@ -51,8 +51,8 @@ MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 5  # seconds: 5, 10, 20, 40, 80
 
 # Se usará la URL del HDFS para lecturas y descargas directas WebHDFS
-HDFS_URI = "hdfs://spark-worker1:9000"
-WEBHDFS_URL = "http://spark-worker1:9870"
+HDFS_URI = "hdfs://spark-master:9000"
+WEBHDFS_URL = "http://spark-master:9870"
 PARQUET_DIR = f"{HDFS_URI}/data/parquet"
 
 
