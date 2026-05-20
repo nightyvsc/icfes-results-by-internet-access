@@ -51,8 +51,8 @@ MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 5  # seconds: 5, 10, 20, 40, 80
 
 # Se usará la URL del HDFS para lecturas y descargas directas WebHDFS
-HDFS_URI = "hdfs://spark-worker1:9000"
-WEBHDFS_URL = "http://spark-worker1:9870"
+HDFS_URI = "hdfs://spark-master:9000"
+WEBHDFS_URL = "http://spark-master:9870"
 PARQUET_DIR = f"{HDFS_URI}/data/parquet"
 
 
@@ -82,6 +82,33 @@ def get_app_token() -> str:
     return token
 
 
+def _hdfs_client():
+    """Cliente WebHDFS contra el NameNode (spark-master).
+
+    Corrige el redirect CREATE: el NameNode puede enviar namenoderpcaddress con el
+    puerto HTTP (9870); los DataNodes necesitan el puerto RPC (9000).
+    """
+    import re
+    from hdfs import InsecureClient
+
+    client = InsecureClient(WEBHDFS_URL)
+    _create = client._create
+
+    def _create_with_rpc_port(*args, **kwargs):
+        res = _create(*args, **kwargs)
+        loc = res.headers.get("location")
+        if loc:
+            res.headers["location"] = re.sub(
+                r"(namenoderpcaddress=[^:&]+):9870",
+                r"\1:9000",
+                loc,
+            )
+        return res
+
+    client._create = _create_with_rpc_port
+    return client
+
+
 def _get_existing_parts(hdfs_client, dataset_raw_hdfs_dir: str) -> set:
     """Escanea HDFS y retorna los índices de partes ya descargadas."""
     existing = set()
@@ -101,13 +128,11 @@ def _get_existing_parts(hdfs_client, dataset_raw_hdfs_dir: str) -> set:
 
 
 def _extract_one_dataset(dataset_name: str, dataset_id: str, app_token: str, parallel_downloads: bool, sample=None) -> None:
-    from hdfs import InsecureClient
     http_session = _build_http_session(app_token)
     print(f"\n--- Procesando dataset: {dataset_name} ({dataset_id}) ---")
     api_url = f"https://www.datos.gov.co/resource/{dataset_id}.json"
 
-    # Cliente WebHDFS
-    hdfs_client = InsecureClient(WEBHDFS_URL)
+    hdfs_client = _hdfs_client()
     dataset_raw_hdfs_dir = f"/data/raw_json/{dataset_name}"
 
     # Crear directorio si no existe (NO borrar datos previos para permitir reanudación)
@@ -307,7 +332,7 @@ def process_with_spark() -> None:
             print(f"\nResumen: Total de registros para '{dataset_name}': {total_rows}")
 
             print(f"Guardando Parquet distribuido en '{dataset_parquet_dir}' ...")
-            df.write.mode("overwrite").parquet(dataset_parquet_dir)
+            df.coalesce(8).write.mode("overwrite").parquet(dataset_parquet_dir)
 
             # Auto-borrado de crudos en HDFS usando la JVM via Py4J
             print(f"Limpiando capa cruda JSON: borrando {dataset_raw_dir} ...")
