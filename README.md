@@ -11,7 +11,7 @@ icfes-results-by-internet-access/
 ├── transform_clean.py      
 ├── requirements.txt
 ├── README.md
-└── (HDFS: spark-master:9000 — bloques en spark-worker1/2)
+└── (HDFS: spark-master:9000 — blocks in spark-worker1/2)
     └── /data/
         ├── raw_json/
         │   ├── icfes/

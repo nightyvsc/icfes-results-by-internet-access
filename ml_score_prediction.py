@@ -48,7 +48,7 @@ MODELS_DIR = f"{HDFS_URI}/data/models"
 
 # Categóricas alineadas con la hipótesis del proyecto (hogar, estudiante, colegio, territorio).
 CATEGORICAL_FEATURES = [
-    "fami_tieneinternet",
+    "nivel_conectividad_municipio",
     "fami_estratovivienda",
     "fami_educacionmadre",
     "fami_educacionpadre",
@@ -62,6 +62,7 @@ CATEGORICAL_FEATURES = [
 ]
 
 NUMERIC_FEATURES = [
+    "flag_internet_hogar",
     "year_icfes",
     "accesos_por_habitante",
     "total_accesos_internet",
@@ -77,12 +78,13 @@ TEST_WEIGHT = 0.15
 ICFES_ML_COLS = (
     ICFES_SCORE_COLS
     + CATEGORICAL_FEATURES
-    + ["cole_cod_mcpio_ubicacion", "periodo", "estu_estadoinvestigacion"]
+    + NUMERIC_FEATURES
+    + ["cod_municipio_norm", "year_icfes"]
 )
 
 
 def _prefer_java11_for_spark() -> None:
-    """XGBoost Spark + PyArrow suele fallar en Java 21 (Unsafe); forzar Java 11 si existe."""
+    """Usar Java 11 para XGBoost Spark."""
     if os.environ.get("ML_USE_SYSTEM_JAVA", "").strip().lower() in ("1", "true", "yes"):
         return
     for candidate in (
@@ -94,11 +96,9 @@ def _prefer_java11_for_spark() -> None:
             os.environ["JAVA_HOME"] = candidate
             if prev and prev != candidate:
                 print(
-                    f"JAVA_HOME cambiado {prev} -> {candidate} (requerido para XGBoost Spark)",
+                    f"JAVA_HOME={candidate}",
                     flush=True,
                 )
-            else:
-                print(f"JAVA_HOME={candidate}", flush=True)
             return
 
 
@@ -118,6 +118,7 @@ def build_ml_spark_session() -> SparkSession:
         .config("spark.logConf", "false")
         .config("spark.sql.debug.maxToStringFields", "8")
         .config("spark.sql.codegen.wholeStage", "false")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "false")
     )
     if driver_java:
         builder = builder.config("spark.driver.extraJavaOptions", driver_java)
@@ -160,7 +161,9 @@ def _ensure_arrow_java_opts() -> None:
         "--add-opens=java.base/java.nio=ALL-UNNAMED "
         "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
         "--add-opens=java.base/java.lang=ALL-UNNAMED "
-        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
+        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED "
+        "-XX:+UnlockDiagnosticVMOptions -XX:+UnsafeUseOffHeapMemory "
+        "-Dio.netty.tryReflectionSetAccessible=true"
     )
     for key in ("SPARK_DRIVER_EXTRA_JAVA_OPTIONS", "SPARK_EXECUTOR_EXTRA_JAVA_OPTIONS"):
         cur = os.environ.get(key, "")
@@ -182,70 +185,27 @@ def build_ml_dataset(
     parquet_clean_dir: str = PARQUET_CLEAN_DIR,
     sample_n: int | None = None,
 ) -> DataFrame:
-    """ICFES (parquet completo) + join municipio internet/cobertura."""
-    icfes_path = os.path.join(parquet_dir, "icfes")
+    """ICFES (parquet limpio) + join municipio internet/cobertura."""
+    icfes_path = os.path.join(parquet_clean_dir, "icfes")
     muni_path = os.path.join(parquet_clean_dir, "municipio_internet_cobertura")
 
+    print(f"Cargando dataset ICFES limpio desde: {icfes_path}")
     raw_icfes = spark.read.parquet(icfes_path)
     icfes_cols = [c for c in ICFES_ML_COLS if c in raw_icfes.columns]
     df = raw_icfes.select(*icfes_cols)
     if sample_n is not None:
         df = df.orderBy(F.rand(RANDOM_SEED)).limit(sample_n)
 
-    df = _cast_existing_numeric(df, ICFES_SCORE_COLS)
-
-    if "cole_cod_mcpio_ubicacion" in df.columns:
-        df = df.withColumn("cod_municipio_norm", _norm_muni("cole_cod_mcpio_ubicacion"))
-    else:
-        df = df.withColumn("cod_municipio_norm", F.lit(None).cast(StringType()))
-
-    if "periodo" in df.columns:
-        df = df.withColumn("year_icfes", _icfes_period_year_expr())
-    else:
-        df = df.withColumn("year_icfes", F.lit(None).cast(IntegerType()))
-
-    if "estu_estadoinvestigacion" in df.columns:
-        st = F.upper(F.trim(F.col("estu_estadoinvestigacion").cast(StringType())))
-        df = df.filter(st == "PUBLICAR")
-
-    df = df.filter(F.col("cod_municipio_norm").isNotNull())
-
-    jvm = spark._jvm
-    hconf = spark._jsc.hadoopConfiguration()
-    muni_exists = jvm.org.apache.hadoop.fs.FileSystem.get(
-        jvm.java.net.URI(muni_path), hconf
-    ).exists(jvm.org.apache.hadoop.fs.Path(muni_path))
-
-    if muni_exists:
-        muni = spark.read.parquet(muni_path).select(
-            "cod_municipio_norm",
-            F.col("year_int").alias("year_icfes"),
-            "total_accesos_internet",
-            "cobertura_neta",
-            "accesos_por_habitante",
-            "departamento",
-        )
-    else:
-        print(
-            f"Aviso: no existe {muni_path}; construyendo join municipio desde parquet crudo.",
-            flush=True,
-        )
-        from transform_clean import BACH_REQUIRED_COLS, INTERNET_REQUIRED_COLS
-
-        raw_inet = spark.read.parquet(os.path.join(parquet_dir, "internet"))
-        raw_bach = spark.read.parquet(os.path.join(parquet_dir, "bachillerato"))
-        inet_cols = [c for c in INTERNET_REQUIRED_COLS if c in raw_inet.columns]
-        bach_cols = [c for c in BACH_REQUIRED_COLS if c in raw_bach.columns]
-        inet = prepare_internet(raw_inet.select(*inet_cols))
-        bach = prepare_bachillerato(raw_bach.select(*bach_cols))
-        muni = build_municipio_internet_cobertura(inet, bach).select(
-            "cod_municipio_norm",
-            F.col("year_int").alias("year_icfes"),
-            "total_accesos_internet",
-            "cobertura_neta",
-            "accesos_por_habitante",
-            "departamento",
-        )
+    print(f"Cargando dataset municipal limpio desde: {muni_path}")
+    muni = spark.read.parquet(muni_path).select(
+        "cod_municipio_norm",
+        F.col("year_int").alias("year_icfes"),
+        "total_accesos_internet",
+        "cobertura_neta",
+        "accesos_por_habitante",
+        "nivel_conectividad_municipio",
+        "departamento",
+    )
 
     df = df.join(muni, on=["cod_municipio_norm", "year_icfes"], how="left")
     df = df.withColumn(

@@ -58,12 +58,22 @@ ICFES_REQUIRED_COLS = ICFES_SCORE_COLS + [
     "cole_cod_mcpio_ubicacion",
     "periodo",
     "estu_estadoinvestigacion",
-    # NUEVAS: requeridas para Filtro-1 (privados de libertad) y
-    # Transformación-1 (flag_internet_hogar / pregunta 2) y pregunta 8
     "estu_privado_libertad",
     "fami_tieneinternet",
     "cole_area_ubicacion",
     "cole_naturaleza",
+    # Socioeconómicas necesarias para ML
+    "fami_estratovivienda",
+    "fami_educacionmadre",
+    "fami_educacionpadre",
+    "fami_tienecomputador",
+    "fami_tieneautomovil",
+    "fami_cuartoshogar",
+    "fami_personashogar",
+    "estu_genero",
+    "cole_jornada",
+    "cole_bilingue",
+    "cole_calendario",
 ]
 
 INTERNET_REQUIRED_COLS = INTERNET_NUM_COLS + [
