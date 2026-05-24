@@ -22,7 +22,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, StringType
 
 from data import PARQUET_DIR
-from ml_train import (
+from ml_score_prediction import (
+    PARQUET_CLEAN_DIR,
     build_ml_spark_session,
 )
 from transform_clean import (
@@ -37,76 +38,80 @@ from transform_clean import (
 
 # Variables de interes socioeconomico y rendimiento
 PROFILING_CAT_FEATURES = [
+    "nivel_conectividad_municipio",
     "fami_estratovivienda",
     "fami_educacionmadre",
     "fami_educacionpadre",
-    "fami_tieneinternet",
     "fami_tienecomputador",
     "fami_tieneautomovil",
     "fami_cuartoshogar",
     "fami_personashogar",
+    "estu_genero",
+    "cole_naturaleza",
+    "cole_jornada",
+    "cole_area_ubicacion",
+    "cole_bilingue",
+    "cole_calendario",
 ]
 
 # Numeric features (from municipality context)
 PROFILING_NUM_FEATURES = [
-    "accesos_por_habitante", # Del municipio
-    "cobertura_neta", # Del municipio
+    "flag_internet_hogar",      
+    "year_icfes",
+    "accesos_por_habitante",    
+    "total_accesos_internet",   
+    "cobertura_neta", 
 ]
 
 ALL_REQUIRED_COLS = (
     PROFILING_CAT_FEATURES
     + PROFILING_NUM_FEATURES
     + ICFES_SCORE_COLS
-    + ["cole_cod_mcpio_ubicacion", "periodo"]
+    + ["cod_municipio_norm", "year_icfes"]
 )
 
 
 def build_profiling_dataset(
     spark: SparkSession,
     sample_n: int | None = None,
-    parquet_dir: str = PARQUET_DIR,
+    parquet_clean_dir: str = PARQUET_CLEAN_DIR,
 ) -> DataFrame:
     """
-    Construye el dataset especifico para profiling sociodemografico.
+    Construye el dataset especifico para profiling cargando datos limpios.
     """
-    icfes_path = os.path.join(parquet_dir, "icfes")
+    icfes_path = os.path.join(parquet_clean_dir, "icfes")
+    muni_path = os.path.join(parquet_clean_dir, "municipio_internet_cobertura")
+    
+    print(f"Cargando dataset ICFES limpio desde: {icfes_path}")
     raw_icfes = spark.read.parquet(icfes_path)
-    
-    # Seleccionamos las variables si existen
+    print("Ruta real leída:", icfes_path)          # <- aquí
+    print("Columnas en raw_icfes:", raw_icfes.columns) 
     cols_to_select = [c for c in ALL_REQUIRED_COLS if c in raw_icfes.columns]
-    df = raw_icfes.select(*cols_to_select)
     
+    # Aseguramos incluir las llaves para el join
+    for key in ["cod_municipio_norm", "year_icfes"]:
+        if key not in cols_to_select and key in raw_icfes.columns:
+            cols_to_select.append(key)
+
+
+
+    df = raw_icfes.select(*cols_to_select)
+    print("Columnas seleccionadas del ICFES:", cols_to_select)
+
     if sample_n is not None:
         df = df.orderBy(F.rand(42)).limit(sample_n)
-
-    df = _cast_existing_numeric(df, ICFES_SCORE_COLS)
-
-    if "cole_cod_mcpio_ubicacion" in df.columns:
-        df = df.withColumn("cod_municipio_norm", _norm_muni("cole_cod_mcpio_ubicacion"))
-    else:
-        df = df.withColumn("cod_municipio_norm", F.lit(None).cast(StringType()))
-
-    if "periodo" in df.columns:
-        df = df.withColumn("year_icfes", _icfes_period_year_expr())
-    else:
-        df = df.withColumn("year_icfes", F.lit(None).cast(DoubleType()))
-
-    df = df.filter(F.col("cod_municipio_norm").isNotNull())
-
-    # Cargar datos municipales
-    raw_inet = spark.read.parquet(os.path.join(parquet_dir, "internet"))
-    raw_bach = spark.read.parquet(os.path.join(parquet_dir, "bachillerato"))
-    inet = prepare_internet(raw_inet)
-    bach = prepare_bachillerato(raw_bach)
-    muni = build_municipio_internet_cobertura(inet, bach).select(
+        
+    print(f"Cargando dataset municipal limpio desde: {muni_path}")
+    muni = spark.read.parquet(muni_path).select(
         "cod_municipio_norm",
         F.col("year_int").alias("year_icfes"),
         "total_accesos_internet",
         "cobertura_neta",
         "accesos_por_habitante",
+        "nivel_conectividad_municipio",
         "departamento",
     )
-
+    
     df = df.join(muni, on=["cod_municipio_norm", "year_icfes"], how="left")
     
     # Drop rows without global score for profiling
@@ -296,10 +301,30 @@ def main() -> None:
     
     # 2. Random Forest Feature Importance (excluye punt_global de las features, lo usa como target)
     train_random_forest_importance(df, PROFILING_CAT_FEATURES, PROFILING_NUM_FEATURES, target_col="punt_global")
-    
+    # Perfil de cada cluster
+    cluster_profile = final_preds.groupBy("prediction").agg(
+        F.count("*").alias("n_estudiantes"),
+        F.round(F.mean("punt_global"), 1).alias("puntaje_promedio"),
+        F.round(F.mean("flag_internet_hogar"), 2).alias("tasa_internet_hogar"),
+        F.round(F.mean("accesos_por_habitante"), 4).alias("accesos_per_cap"),
+        # Moda de variables categóricas
+        F.first(
+            F.col("fami_estratovivienda"), ignorenulls=True
+        ).alias("estrato_frecuente"),
+        F.first(
+            F.col("fami_educacionmadre"), ignorenulls=True
+        ).alias("educ_madre_frecuente"),
+        F.first(
+            F.col("nivel_conectividad_municipio"), ignorenulls=True
+        ).alias("conectividad_municipio"),
+    ).orderBy("puntaje_promedio", ascending=False)
+
+    cluster_profile.show(truncate=False)
     df.unpersist()
     spark.stop()
+    
 
 
 if __name__ == "__main__":
     main()
+    
