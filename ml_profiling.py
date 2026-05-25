@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Any
 
@@ -24,6 +25,7 @@ from pyspark.sql.types import DoubleType, StringType
 from data import PARQUET_DIR
 from ml_score_prediction import (
     PARQUET_CLEAN_DIR,
+    RESULTS_DIR,
     build_ml_spark_session,
 )
 from transform_clean import (
@@ -249,9 +251,18 @@ def train_random_forest_importance(
     eval_r2 = RegressionEvaluator(labelCol=target_col, predictionCol="prediction", metricName="r2")
     
     print("\n--- Metricas de Evaluacion (Random Forest) ---")
-    print(f"RMSE (Root Mean Squared Error): {eval_rmse.evaluate(predictions):.3f}")
-    print(f"MAE (Mean Absolute Error):      {eval_mae.evaluate(predictions):.3f}")
-    print(f"R² (Coeficiente Determ.):       {eval_r2.evaluate(predictions):.3f}")
+    rmse_val = eval_rmse.evaluate(predictions)
+    mae_val  = eval_mae.evaluate(predictions)
+    r2_val   = eval_r2.evaluate(predictions)
+    print(f"RMSE (Root Mean Squared Error): {rmse_val:.3f}")
+    print(f"MAE (Mean Absolute Error):      {mae_val:.3f}")
+    print(f"R² (Coeficiente Determ.):       {r2_val:.3f}")
+
+    rf_metrics = {
+        "rmse": round(rmse_val, 4),
+        "mae": round(mae_val, 4),
+        "r2": round(r2_val, 4),
+    }
     
     # Extraer importancias
     rf_model = model.stages[-1]
@@ -266,7 +277,44 @@ def train_random_forest_importance(
     }).sort_values(by="Importance", ascending=False)
     
     print(df_importances.to_string(index=False))
-    return df_importances
+    return df_importances, rf_metrics
+
+
+def export_profiling_results(
+    fi_df: pd.DataFrame,
+    rf_metrics: dict,
+    k_vals: list[int],
+    silhouette_scores: list[float],
+    cluster_profile_pd: pd.DataFrame,
+    results_dir: str = RESULTS_DIR,
+) -> None:
+    """
+    Exporta resultados del perfilamiento a archivos locales para el dashboard.
+    Llama esta función al final de main(), antes de spark.stop().
+    """
+    os.makedirs(results_dir, exist_ok=True)
+
+    # feature_importance.parquet
+    fi_path = os.path.join(results_dir, "feature_importance.parquet")
+    fi_df.to_parquet(fi_path, index=False)
+    print(f"[export] Importancia de features → {fi_path}")
+
+    # metrics_rf.json
+    rf_path = os.path.join(results_dir, "metrics_rf.json")
+    with open(rf_path, "w") as f:
+        json.dump(rf_metrics, f, indent=2)
+    print(f"[export] Métricas Random Forest → {rf_path}")
+
+    # elbow.json — curva de codo (silhouette por K)
+    elbow_path = os.path.join(results_dir, "elbow.json")
+    with open(elbow_path, "w") as f:
+        json.dump({"k": k_vals, "silhouette": silhouette_scores}, f, indent=2)
+    print(f"[export] Curva del codo → {elbow_path}")
+
+    # cluster_profiles.parquet
+    cp_path = os.path.join(results_dir, "cluster_profiles.parquet")
+    cluster_profile_pd.to_parquet(cp_path, index=False)
+    print(f"[export] Perfiles de cluster → {cp_path}")
 
 
 def main() -> None:
@@ -300,7 +348,7 @@ def main() -> None:
     final_preds.groupBy("prediction").count().orderBy("prediction").show()
     
     # 2. Random Forest Feature Importance (excluye punt_global de las features, lo usa como target)
-    train_random_forest_importance(df, PROFILING_CAT_FEATURES, PROFILING_NUM_FEATURES, target_col="punt_global")
+    fi_df, rf_metrics = train_random_forest_importance(df, PROFILING_CAT_FEATURES, PROFILING_NUM_FEATURES, target_col="punt_global")
     # Perfil de cada cluster
     cluster_profile = final_preds.groupBy("prediction").agg(
         F.count("*").alias("n_estudiantes"),
@@ -320,6 +368,13 @@ def main() -> None:
     ).orderBy("puntaje_promedio", ascending=False)
 
     cluster_profile.show(truncate=False)
+    export_profiling_results(
+        fi_df=fi_df,
+        rf_metrics=rf_metrics,
+        k_vals=k_vals,
+        silhouette_scores=scores,
+        cluster_profile_pd=cluster_profile.toPandas(),
+    )
     df.unpersist()
     spark.stop()
     
