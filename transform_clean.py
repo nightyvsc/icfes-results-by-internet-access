@@ -502,6 +502,127 @@ def build_municipio_internet_cobertura(
     return joined
 
 
+def build_municipio_agg_icfes(df_icfes: DataFrame) -> DataFrame:
+    """
+    Agrega features socioeconómicas de ICFES a nivel municipio-año.
+
+    Calcula:
+    - prom_estrato_hogar: promedio estrato
+    - pct_internet_hogar: % con internet
+    - pct_educacion_madre_superior: % madres con educación superior
+    - pct_educacion_padre_superior: % padres con educación superior
+    - pct_colegio_privado: % en colegio privado
+    - pct_area_urbana: % en zona urbana
+    - promedio_personas_hogar: promedio personas por hogar
+    - pct_hogar_computador: % con computador
+    - puntaje_global_promedio: promedio puntaje global
+
+    Retorna: DataFrame agregado por (cod_municipio_norm, year_int)
+    """
+    if df_icfes.count() == 0:
+        print("Aviso: DataFrame ICFES está vacío, retornando DataFrame vacío")
+        return df_icfes.limit(0)
+
+    # Crear flags para categorías
+    df = df_icfes
+
+    # Flag educación madre superior
+    if "fami_educacionmadre" in df.columns:
+        df = df.withColumn(
+            "flag_edu_madre_superior",
+            F.when(F.col("fami_educacionmadre").like("%Superior%"), F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_edu_madre_superior", F.lit(0))
+
+    # Flag educación padre superior
+    if "fami_educacionpadre" in df.columns:
+        df = df.withColumn(
+            "flag_edu_padre_superior",
+            F.when(F.col("fami_educacionpadre").like("%Superior%"), F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_edu_padre_superior", F.lit(0))
+
+    # Flag colegio privado
+    if "cole_naturaleza" in df.columns:
+        df = df.withColumn(
+            "flag_privado",
+            F.when(F.col("cole_naturaleza") == "NO OFICIAL", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_privado", F.lit(0))
+
+    # Flag área urbana
+    if "cole_area_ubicacion" in df.columns:
+        df = df.withColumn(
+            "flag_urbano",
+            F.when(F.col("cole_area_ubicacion") == "URBANA", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_urbano", F.lit(0))
+
+    # Flag computador en hogar
+    if "fami_tienecomputador" in df.columns:
+        df = df.withColumn(
+            "flag_computador",
+            F.when(F.upper(F.col("fami_tienecomputador")) == "SI", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_computador", F.lit(0))
+
+    # Convertir estrato a numérico (safe)
+    if "fami_estratovivienda" in df.columns:
+        df = df.withColumn(
+            "estrato_num",
+            F.when(F.col("fami_estratovivienda").isNotNull(),
+                   F.col("fami_estratovivienda").cast(IntegerType()))
+             .otherwise(None)
+        )
+    else:
+        df = df.withColumn("estrato_num", F.lit(None).cast(IntegerType()))
+
+    # Convertir personas a numérico
+    if "fami_personashogar" in df.columns:
+        df = df.withColumn(
+            "personas_num",
+            F.when(F.col("fami_personashogar").isNotNull(),
+                   F.col("fami_personashogar").cast(IntegerType()))
+             .otherwise(None)
+        )
+    else:
+        df = df.withColumn("personas_num", F.lit(None).cast(IntegerType()))
+
+    # Filtrar por year_icfes válido
+    df = df.filter(F.col("year_icfes").isNotNull())
+    df = df.filter(F.col("cod_municipio_norm").isNotNull())
+
+    # Agrupar por municipio-año
+    key_cols = ["cod_municipio_norm", "year_icfes"]
+    agg_df = df.groupBy(*key_cols).agg(
+        F.round(F.avg("estrato_num"), 2).alias("prom_estrato_hogar"),
+        (F.sum("flag_internet_hogar") / F.count("*") * 100).alias("pct_internet_hogar"),
+        (F.sum("flag_edu_madre_superior") / F.count("*") * 100).alias("pct_educacion_madre_superior"),
+        (F.sum("flag_edu_padre_superior") / F.count("*") * 100).alias("pct_educacion_padre_superior"),
+        (F.sum("flag_privado") / F.count("*") * 100).alias("pct_colegio_privado"),
+        (F.sum("flag_urbano") / F.count("*") * 100).alias("pct_area_urbana"),
+        F.round(F.avg("personas_num"), 2).alias("promedio_personas_hogar"),
+        (F.sum("flag_computador") / F.count("*") * 100).alias("pct_hogar_computador"),
+        F.round(F.avg("punt_global"), 2).alias("puntaje_global_promedio"),
+        F.count("*").alias("n_estudiantes"),
+    )
+
+    # Renombrar year_icfes a year_int para consistencia
+    agg_df = agg_df.withColumnRenamed("year_icfes", "year_int")
+
+    return agg_df
+
+
 def summarize_print(name: str, df: DataFrame, show_rows: int = 20) -> None:
     print("\n" + "=" * 60)
     print(f"RESULTADO: {name}")

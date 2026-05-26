@@ -351,3 +351,74 @@ python ml_profiling.py --sample 50000 --max-k 8
 | `--max-k N` | Maximum number of clusters to test for the Elbow Method | 8 |
 
 The `ml_algorithms.ipynb` notebook also includes this profiling pipeline, providing a plot of the Silhouette Score vs. number of clusters (Elbow Method curve) and a bar chart visualizing the Feature Importance of the Random Forest model.
+
+## Autoencoder for Anomaly Detection
+
+This module implements an unsupervised anomaly detection pipeline using an autoencoder neural network. The model learns the normal pattern of Colombian municipalities based on connectivity and socioeconomic features; municipalities that deviate significantly from this pattern are flagged as anomalies.
+
+Unlike the supervised XGBoost regression (which predicts ICFES scores), the autoencoder identifies territorial outliers without requiring labeled data, making it suitable for exploratory analysis and early warning systems.
+
+### Architecture
+
+The autoencoder compresses 13 input features into a 4‑dimensional latent space (compression ratio ≈ 70%) and then reconstructs the original input.
+
+Input (13) → Encoder (12→8→4) → Bottleneck (4) → Decoder (8→12→13) → Output (13)
+
+
+| Layer | Dimensions | Activation |
+|-------|------------|------------|
+| Encoder | 13 → 12 → 8 → 4 | ReLU |
+| Bottleneck | 4 | linear |
+| Decoder | 4 → 8 → 12 → 13 | ReLU (hidden), linear (output) |
+
+**Reconstruction error** (MSE) measures how unusual a municipality‑year is. A high error means the municipality’s profile does not match the “normal” pattern learned from the training set.
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `ml_autoencoder.py` | PyTorch model definition (`AutoencoderMunicipal`) and loss functions. |
+| `train_encoder_distributor.py` | Distributed training utilities using Spark `TorchDistributor` + PyTorch DDP. |
+| `encoder_pipeline.py` | End‑to‑end pipeline: feature engineering, train/val/test split, distributed training, evaluation, and anomaly reporting. |
+
+### Requirements
+
+In addition to the general prerequisites (Python 3.8+, Spark cluster, HDFS), the autoencoder requires:
+
+- PyTorch (installed via `requirements.txt`)
+- All worker nodes must have the project directory NFS‑mounted at the same path (default `/mnt/icfes-results-by-internet-access-1`) so that `ml_autoencoder.py` is importable by the distributed workers.
+
+The training uses **Gloo** as the distributed backend (CPU‑only). The implementation avoids the common `Gloo timeout` problem by loading and serialising data on the driver **before** launching `TorchDistributor`, ensuring that every worker receives the data as in‑memory bytes and never accesses HDFS inside the DDP barrier.
+
+### Usage
+
+#### Full pipeline (feature engineering → training → evaluation)
+
+```bash
+python encoder_pipeline.py
+```
+
+This executes all phases:
+
+Load & feature engineering – reads parquet_clean from HDFS, joins municipality internet data with aggregated ICFES socioeconomic features, and prepares the final feature set (13 columns).
+
+Train/val/test split – 70/15/15, saved to ae_datasets/ under the clean Parquet directory.
+
+Distributed training – launches 2 DDP workers (default) using TorchDistributor. The model is saved to data/models/autoencoder_municipal/.
+
+Evaluation – computes reconstruction error on the test set, determines the anomaly threshold (percentile or statistical method), and flags anomalous municipalities.
+
+Report – generates CSV reports (anomaly classification, feature contributions, top anomalies) and a summary JSON.
+
+Option	Default	Description
+--epochs	50	Number of training epochs.
+--workers	2	Number of DDP processes (Spark workers).
+--latent-dim	4	Bottleneck dimension.
+--batch-size	32	Batch size per worker.
+--lr	1e-3	Learning rate.
+--early-stopping	10	Patience for early stopping.
+--threshold-pct	95	Percentile used for anomaly threshold (only when --anomaly-method percentile).
+--anomaly-method	percentile	Method for threshold: percentile (fixed) or statistical (mean+2σ if normal).
+--skip-training	False	Load an existing model from model_dir without retraining.
+--skip-eval	False	Skip evaluation and reporting.
+--local	False	Force Spark local mode (for testing).
