@@ -15,6 +15,10 @@ scikit-learn>=1.0.0,<2
 pyarrow>=17.0.0,<19
 matplotlib>=3.5.0,<4
 
+# Autoencoder (encoder_pipeline.py + ml_autoencoder.py)
+torch>=2.0.0,<3          # PyTorch — autoencoder model + TorchDistributor DDP training
+scipy>=1.9.0,<2          # Shapiro-Wilk test for adaptive anomaly threshold
+
 # Dashboard
 streamlit>=1.35.0,<2
 plotly>=5.20.0,<6
