@@ -1,11 +1,5 @@
-# PySpark: pin to the latest 4.0.x available on PyPI. (4.1.1 is not published there yet;
-# `pip` then fails with "No matching distribution found".)
 pyspark==3.5.2
-
-# HTTP client for data.py (Socrata). Let pip resolve compatible transitive versions.
 requests>=2.28.0,<3
-
-# HDFS pure-python client to upload without relying on local Hadoop install
 hdfs==2.7.3
 
 # XGBoost Spark estimator (SparkXGBRegressor; requiere pandas en driver/executors)
