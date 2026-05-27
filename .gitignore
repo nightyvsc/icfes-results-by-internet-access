@@ -208,3 +208,4 @@ __marimo__/
 /data/
 data/results/
 dashboard/streamlit.log
+hdfs:/*

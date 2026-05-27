@@ -50,7 +50,6 @@ ANOMALY_COLORS = {
 
 st.set_page_config(
     page_title="ICFES × Internet — Resultados",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -140,7 +139,7 @@ def load_ae_contributions() -> pd.DataFrame:
 # Header
 # ---------------------------------------------------------------------------
 
-st.title("📊 ICFES × Acceso a Internet")
+st.title("ICFES × Acceso a Internet")
 st.caption(
     "Resultados de los modelos entrenados sobre datos del ICFES Saber 11, "
     "conectividad municipal (MinTIC) y cobertura educativa (MEN)."
@@ -165,9 +164,9 @@ ae_available = all(os.path.exists(_path(f)) for f in AE_FILES)
 # ---------------------------------------------------------------------------
 
 tab_xgb, tab_profiling, tab_ae = st.tabs([
-    "🤖 XGBoost — Predicción de Puntajes",
-    "🔍 Perfilamiento Socioeconómico",
-    "🧠 Autoencoder — Anomalías Territoriales",
+    "XGBoost — Predicción de Puntajes",
+    "Perfilamiento Socioeconómico",
+    "Autoencoder — Anomalías Territoriales",
 ])
 
 # ===========================================================================
@@ -202,7 +201,7 @@ with tab_xgb:
         df_bar = pd.DataFrame([
             {"Puntaje": SCORE_LABELS.get(t, t), "RMSE": v["rmse"]}
             for t, v in metrics_xgb.items()
-        ]).sort_values("RMSE")
+        ]).sort_values("RMSE", ascending=False)
         fig_rmse = px.bar(
             df_bar, x="RMSE", y="Puntaje", orientation="h",
             color="RMSE", color_continuous_scale="Blues", text_auto=".2f",
@@ -215,7 +214,7 @@ with tab_xgb:
         df_r2 = pd.DataFrame([
             {"Puntaje": SCORE_LABELS.get(t, t), "R²": v["r2"]}
             for t, v in metrics_xgb.items()
-        ]).sort_values("R²", ascending=False)
+        ]).sort_values("R²")
         fig_r2 = px.bar(
             df_r2, x="R²", y="Puntaje", orientation="h",
             color="R²", color_continuous_scale="Greens", text_auto=".4f",
@@ -227,22 +226,24 @@ with tab_xgb:
 
     st.subheader("Predicción vs Real — Puntaje Global (muestra de prueba)")
     preds = load_predictions()
-    fig_scatter = px.scatter(
-        preds, x="label", y="prediction", opacity=0.35,
-        labels={"label": "Puntaje real", "prediction": "Puntaje predicho"},
-        color_discrete_sequence=["#1f77b4"],
-    )
     max_val = max(preds["label"].max(), preds["prediction"].max())
     min_val = min(preds["label"].min(), preds["prediction"].min())
+    fig_scatter = px.density_heatmap(
+        preds, x="label", y="prediction",
+        nbinsx=50, nbinsy=50,
+        color_continuous_scale="Blues",
+        labels={"label": "Puntaje real", "prediction": "Puntaje predicho"},
+    )
     fig_scatter.add_trace(go.Scatter(
         x=[min_val, max_val], y=[min_val, max_val],
         mode="lines", line=dict(color="red", dash="dash", width=1.5),
         name="Predicción perfecta",
     ))
-    fig_scatter.update_layout(margin=dict(l=0, r=0))
+    fig_scatter.update_layout(margin=dict(l=0, r=0), coloraxis_showscale=False)
     st.plotly_chart(fig_scatter, use_container_width=True)
     st.caption(
         f"Muestra de {len(preds):,} estudiantes del conjunto de prueba. "
+        "Celdas más oscuras indican mayor concentración de predicciones. "
         "La línea roja representa predicción perfecta."
     )
 
@@ -452,9 +453,9 @@ with tab_ae:
 
     # --- Top anomalies tables ---
     st.subheader("Top municipios anómalos por error de reconstrucción")
-    for cls_label, icon in [
-        ("ANOMALÍA_NEGATIVA", "🔴"),
-        ("ANOMALÍA_POSITIVA", "🔵"),
+    for cls_label, label in [
+        ("ANOMALÍA_NEGATIVA", "ANOMALÍA_NEGATIVA — Top 10"),
+        ("ANOMALÍA_POSITIVA", "ANOMALÍA_POSITIVA — Top 10"),
     ]:
         subset = ae_res[ae_res["anomaly_class"] == cls_label]
         if subset.empty:
@@ -471,7 +472,7 @@ with tab_ae:
             "anomaly_score_pct":       "{:.1f}",
             "puntaje_global_promedio": "{:.1f}",
         }.items() if k in cols_show}
-        st.markdown(f"**{icon} {cls_label} — Top 10**")
+        st.markdown(f"**{label}**")
         st.dataframe(
             top[cols_show].style.format(fmt_top, na_rep="—"),
             use_container_width=True,
