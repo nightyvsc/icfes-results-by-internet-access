@@ -16,6 +16,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Any
 
@@ -45,6 +46,7 @@ from transform_clean import (
 
 PARQUET_CLEAN_DIR = f"{HDFS_URI}/data/parquet_clean"
 MODELS_DIR = f"{HDFS_URI}/data/models"
+RESULTS_DIR = os.environ.get("RESULTS_DIR", "data/results")
 
 # Categóricas alineadas con la hipótesis del proyecto (hogar, estudiante, colegio, territorio).
 CATEGORICAL_FEATURES = [
@@ -445,6 +447,45 @@ def print_metrics_table(results: list[dict[str, Any]]) -> None:
     print("=" * 72)
 
 
+def export_training_results(
+    results: list[dict[str, Any]],
+    results_dir: str = RESULTS_DIR,
+) -> None:
+    """
+    Exporta métricas y muestra de predicciones a archivos locales para el dashboard.
+    Llama esta función al final de main(), antes de spark.stop().
+    """
+    os.makedirs(results_dir, exist_ok=True)
+
+    # 1. metrics_xgb.json — una entrada por target
+    metrics: dict[str, dict] = {}
+    for r in results:
+        metrics[r["target"]] = {
+            "rmse": round(r["rmse"], 4),
+            "mae": round(r["mae"], 4),
+            "r2": round(r["r2"], 4),
+            "n_test": r["n_test"],
+            "n_train_val": r["n_train_val"],
+        }
+    metrics_path = os.path.join(results_dir, "metrics_xgb.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[export] Métricas XGBoost → {metrics_path}")
+
+    # 2. predictions_sample.parquet — label vs prediction para punt_global (máx 5 000 filas)
+    global_res = next((r for r in results if r["target"] == "punt_global"), None)
+    if global_res is not None:
+        preds_pd = (
+            global_res["test_predictions"]
+            .select("label", "prediction")
+            .limit(5_000)
+            .toPandas()
+        )
+        preds_path = os.path.join(results_dir, "predictions_sample.parquet")
+        preds_pd.to_parquet(preds_path, index=False)
+        print(f"[export] Muestra predicciones punt_global → {preds_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Entrena XGBoost Spark sobre ICFES.")
     parser.add_argument(
@@ -497,6 +538,7 @@ def main() -> None:
         results.append(res)
 
     print_metrics_table(results)
+    export_training_results(results)
     df.unpersist()
     spark.stop()
 

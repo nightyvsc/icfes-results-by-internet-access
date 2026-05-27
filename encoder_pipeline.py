@@ -83,6 +83,8 @@ FEATURE_COLUMNS = [
     "velocidad_bajada",
 ]
 
+RESULTS_DIR = os.environ.get("RESULTS_DIR", "data/results")
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -841,6 +843,52 @@ def _generate_report(classified_df) -> str:
     return "\\n".join(lines)
 
 
+def export_autoencoder_results(
+    results_pd,
+    contrib_df,
+    summary_df,
+    summary: dict,
+    history: dict,
+    results_dir: str = RESULTS_DIR,
+) -> None:
+    """
+    Exporta resultados del autoencoder a archivos locales para el dashboard.
+    Llama esta función al final de evaluate_and_report(), antes de return summary.
+    Todos los DataFrames ya están en memoria (pandas) en ese punto — sin Spark.
+    """
+    import pandas as pd
+
+    os.makedirs(results_dir, exist_ok=True)
+
+    # ae_anomaly_results.parquet — test set completo con clasificación
+    results_pd.to_parquet(
+        os.path.join(results_dir, "ae_anomaly_results.parquet"), index=False
+    )
+    log.info(f"[export] Resultados clasificados → {results_dir}/ae_anomaly_results.parquet")
+
+    # ae_feature_contributions.parquet — contribución por feature (formato largo)
+    contrib_df.to_parquet(
+        os.path.join(results_dir, "ae_feature_contributions.parquet"), index=False
+    )
+    log.info(f"[export] Contribuciones por feature → {results_dir}/ae_feature_contributions.parquet")
+
+    # ae_anomaly_summary.parquet — estadísticas agrupadas por clase
+    summary_df.to_parquet(
+        os.path.join(results_dir, "ae_anomaly_summary.parquet"), index=False
+    )
+    log.info(f"[export] Resumen por clase → {results_dir}/ae_anomaly_summary.parquet")
+
+    # ae_summary.json — umbral, conteos, métricas de entrenamiento
+    with open(os.path.join(results_dir, "ae_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    log.info(f"[export] Resumen JSON → {results_dir}/ae_summary.json")
+
+    # ae_training_history.json — curva de pérdida train/val por época
+    with open(os.path.join(results_dir, "ae_training_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+    log.info(f"[export] Historial de entrenamiento → {results_dir}/ae_training_history.json")
+
+
 # ---------------------------------------------------------------------------
 # Fase 5 + 6 + 7: Evaluación y reporte de anomalías
 # ---------------------------------------------------------------------------
@@ -1014,6 +1062,14 @@ def evaluate_and_report(spark, test_path: str, model_dir: str, output_dir: str):
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     log.info(f"Resumen JSON: {summary_path}")
+
+    export_autoencoder_results(
+        results_pd=results_pd,
+        contrib_df=contrib_df,
+        summary_df=summary_df,
+        summary=summary,
+        history=history,
+    )
 
     return summary
 
