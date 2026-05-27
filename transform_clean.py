@@ -58,11 +58,31 @@ ICFES_REQUIRED_COLS = ICFES_SCORE_COLS + [
     "cole_cod_mcpio_ubicacion",
     "periodo",
     "estu_estadoinvestigacion",
+    "estu_privado_libertad",
+    "fami_tieneinternet",
+    "cole_area_ubicacion",
+    "cole_naturaleza",
+    # Socioeconómicas necesarias para ML
+    "fami_estratovivienda",
+    "fami_educacionmadre",
+    "fami_educacionpadre",
+    "fami_tienecomputador",
+    "fami_tieneautomovil",
+    "fami_cuartoshogar",
+    "fami_personashogar",
+    "estu_genero",
+    "cole_jornada",
+    "cole_bilingue",
+    "cole_calendario",
 ]
 
 INTERNET_REQUIRED_COLS = INTERNET_NUM_COLS + [
     "cod_municipio",
     "anno",
+    # NUEVAS: requeridas para Filtro-2 (residencial) y Transformación-2
+    # (categoría velocidad / pregunta 3)
+    "segmento",
+    "tecnologia",
 ]
 
 BACH_REQUIRED_COLS = BACH_NUM_COLS + [
@@ -241,6 +261,19 @@ def prepare_icfes(df: DataFrame) -> DataFrame:
         st = F.upper(F.trim(F.col("estu_estadoinvestigacion").cast(StringType())))
         out = out.filter(st == "PUBLICAR")
 
+    # ──────────────────────────────────────────────────────────────────────
+    # FILTRO 1 (nuevo): Excluir estudiantes privados de libertad.
+    # Justificación: Las preguntas 2, 4, 7 y 8 analizan la relación entre
+    # acceso a internet en el hogar y resultados Saber 11, y brechas
+    # urbano-rural y oficial/no-oficial. Los estudiantes privados de libertad
+    # tienen condiciones de acceso a internet radicalmente distintas (sin
+    # hogar familiar activo) que sesgarían el análisis comparativo de
+    # conectividad-desempeño y la variable fami_tieneinternet.
+    # ──────────────────────────────────────────────────────────────────────
+    if "estu_privado_libertad" in out.columns:
+        pl = F.upper(F.trim(F.col("estu_privado_libertad").cast(StringType())))
+        out = out.filter((pl != "S") | pl.isNull())
+
     out = out.filter(F.col("cod_municipio_norm").isNotNull())
 
     # Puntajes Saber 11 ~0–500; eliminar filas fuera de rango (datos alterados).
@@ -253,6 +286,26 @@ def prepare_icfes(df: DataFrame) -> DataFrame:
     # Atípicos por IQR sobre punt_global (avance metodológico; entrega 2 puede refinar).
     if "punt_global" in out.columns:
         out = apply_iqr_filter(out, "punt_global")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 1 (nueva): flag_internet_hogar → columna binaria 0/1.
+    # Convierte fami_tieneinternet (Si / No / null) a entero para habilitar
+    # correlaciones y regresiones directas sobre el acceso doméstico.
+    # Justificación: La pregunta 2 requiere cuantificar la asociación entre
+    # tener internet en casa y el puntaje global; una variable categórica
+    # impide calcular correlaciones de Pearson/Spearman y usarla como
+    # predictor numérico. Con 0/1 también se puede calcular la tasa de
+    # penetración doméstica por municipio (mean), necesaria para las
+    # comparaciones de conectividad de preguntas 1, 4 y 8.
+    # ──────────────────────────────────────────────────────────────────────
+    if "fami_tieneinternet" in out.columns:
+        inet_str = F.upper(F.trim(F.col("fami_tieneinternet").cast(StringType())))
+        out = out.withColumn(
+            "flag_internet_hogar",
+            F.when(inet_str == "SI", F.lit(1))
+             .when(inet_str == "NO", F.lit(0))
+             .otherwise(F.lit(None).cast(IntegerType())),
+        )
 
     # Imputación por media: punt_ingles (ejemplo tipo PDF) — solo donde sigue null.
     if "punt_ingles" in out.columns:
@@ -292,6 +345,41 @@ def prepare_internet(df: DataFrame) -> DataFrame:
 
     if "no_de_accesos" in out.columns:
         out = apply_iqr_filter(out, "no_de_accesos")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FILTRO 2 (nuevo): Conservar solo registros del segmento residencial.
+    # Justificación: Las preguntas 1, 2, 3, 4 y 7 analizan la conectividad
+    # doméstica (hogar del estudiante) y su impacto en resultados Saber 11.
+    # El segmento corporativo (empresas) no representa el acceso del hogar
+    # del estudiante y distorsiona métricas como accesos_por_habitante y la
+    # correlación con fami_tieneinternet. Filtrar a "residencial" (estratos
+    # 1-6) garantiza que los accesos agregados por municipio reflejen la
+    # penetración hogareña real, que es el eje de todas las preguntas de
+    # negocio.
+    # ──────────────────────────────────────────────────────────────────────
+    if "segmento" in out.columns:
+        seg = F.lower(F.trim(F.col("segmento").cast(StringType())))
+        out = out.filter(seg.contains("residencial") | seg.isNull())
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 2 (nueva): categoria_velocidad_bajada
+    # Clasifica la velocidad de descarga en tres rangos estándar UIT-T
+    # (baja < 10 Mbps | media 10-100 Mbps | alta > 100 Mbps).
+    # Justificación: La pregunta 3 pregunta qué tecnologías predominan en
+    # municipios con mejor/peor desempeño y si existe relación con la
+    # velocidad. Una variable continua es difícil de comparar entre grupos
+    # de municipios; la categoría permite hacer tablas de contingencia
+    # tecnología × velocidad × desempeño, y es la clasificación usada por
+    # la OCDE y MinTIC para reportes de banda ancha.
+    # ──────────────────────────────────────────────────────────────────────
+    if "velocidad_bajada" in out.columns:
+        out = out.withColumn(
+            "categoria_velocidad_bajada",
+            F.when(F.col("velocidad_bajada").isNull(), F.lit(None).cast(StringType()))
+             .when(F.col("velocidad_bajada") < 10,  F.lit("baja"))
+             .when(F.col("velocidad_bajada") <= 100, F.lit("media"))
+             .otherwise(F.lit("alta")),
+        )
 
     return out
 
@@ -381,7 +469,158 @@ def build_municipio_internet_cobertura(
             F.col("total_accesos_internet") / F.col("poblaci_n_5_16"),
         ).otherwise(None),
     )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TRANSFORMACIÓN 3 (nueva): nivel_conectividad_municipio
+    # Clasifica cada municipio en "alta", "media" o "baja" conectividad
+    # usando terciles de accesos_por_habitante (cortes al percentil 33 y 66).
+    # Justificación: Las preguntas 1, 4, 6 y 7 comparan explícitamente
+    # municipios con "alta y baja cobertura de internet". Sin esta variable
+    # categórica habría que recalcular los cortes en cada análisis posterior.
+    # Se usan terciles (33-66) en lugar de mediana porque permiten distinguir
+    # un grupo intermedio que revela patrones de desempeño no lineales; es
+    # la estratificación recomendada por el DNP en informes de brechas
+    # digitales territoriales. La columna se calcula una sola vez aquí y
+    # quedará disponible en el Parquet de municipio_internet_cobertura.
+    # ──────────────────────────────────────────────────────────────────────
+    col_aph = "accesos_por_habitante"
+    qs_aph = joined.approxQuantile(col_aph, [0.33, 0.66], relativeError=0.01)
+    if qs_aph and qs_aph[0] is not None and qs_aph[1] is not None:
+        p33, p66 = float(qs_aph[0]), float(qs_aph[1])
+        joined = joined.withColumn(
+            "nivel_conectividad_municipio",
+            F.when(F.col(col_aph).isNull(), F.lit(None).cast(StringType()))
+             .when(F.col(col_aph) <= p33, F.lit("baja"))
+             .when(F.col(col_aph) <= p66, F.lit("media"))
+             .otherwise(F.lit("alta")),
+        )
+    else:
+        joined = joined.withColumn(
+            "nivel_conectividad_municipio", F.lit(None).cast(StringType())
+        )
+
     return joined
+
+
+def build_municipio_agg_icfes(df_icfes: DataFrame) -> DataFrame:
+    """
+    Agrega features socioeconómicas de ICFES a nivel municipio-año.
+
+    Calcula:
+    - prom_estrato_hogar: promedio estrato
+    - pct_internet_hogar: % con internet
+    - pct_educacion_madre_superior: % madres con educación superior
+    - pct_educacion_padre_superior: % padres con educación superior
+    - pct_colegio_privado: % en colegio privado
+    - pct_area_urbana: % en zona urbana
+    - promedio_personas_hogar: promedio personas por hogar
+    - pct_hogar_computador: % con computador
+    - puntaje_global_promedio: promedio puntaje global
+
+    Retorna: DataFrame agregado por (cod_municipio_norm, year_int)
+    """
+    if df_icfes.count() == 0:
+        print("Aviso: DataFrame ICFES está vacío, retornando DataFrame vacío")
+        return df_icfes.limit(0)
+
+    # Crear flags para categorías
+    df = df_icfes
+
+    # Flag educación madre superior
+    if "fami_educacionmadre" in df.columns:
+        df = df.withColumn(
+            "flag_edu_madre_superior",
+            F.when(F.col("fami_educacionmadre").like("%Superior%"), F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_edu_madre_superior", F.lit(0))
+
+    # Flag educación padre superior
+    if "fami_educacionpadre" in df.columns:
+        df = df.withColumn(
+            "flag_edu_padre_superior",
+            F.when(F.col("fami_educacionpadre").like("%Superior%"), F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_edu_padre_superior", F.lit(0))
+
+    # Flag colegio privado
+    if "cole_naturaleza" in df.columns:
+        df = df.withColumn(
+            "flag_privado",
+            F.when(F.col("cole_naturaleza") == "NO OFICIAL", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_privado", F.lit(0))
+
+    # Flag área urbana
+    if "cole_area_ubicacion" in df.columns:
+        df = df.withColumn(
+            "flag_urbano",
+            F.when(F.col("cole_area_ubicacion") == "URBANA", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_urbano", F.lit(0))
+
+    # Flag computador en hogar
+    if "fami_tienecomputador" in df.columns:
+        df = df.withColumn(
+            "flag_computador",
+            F.when(F.upper(F.col("fami_tienecomputador")) == "SI", F.lit(1))
+             .otherwise(F.lit(0))
+        )
+    else:
+        df = df.withColumn("flag_computador", F.lit(0))
+
+    # Convertir estrato a numérico (safe)
+    if "fami_estratovivienda" in df.columns:
+        df = df.withColumn(
+            "estrato_num",
+            F.when(F.col("fami_estratovivienda").isNotNull(),
+                   F.col("fami_estratovivienda").cast(IntegerType()))
+             .otherwise(None)
+        )
+    else:
+        df = df.withColumn("estrato_num", F.lit(None).cast(IntegerType()))
+
+    # Convertir personas a numérico
+    if "fami_personashogar" in df.columns:
+        df = df.withColumn(
+            "personas_num",
+            F.when(F.col("fami_personashogar").isNotNull(),
+                   F.col("fami_personashogar").cast(IntegerType()))
+             .otherwise(None)
+        )
+    else:
+        df = df.withColumn("personas_num", F.lit(None).cast(IntegerType()))
+
+    # Filtrar por year_icfes válido
+    df = df.filter(F.col("year_icfes").isNotNull())
+    df = df.filter(F.col("cod_municipio_norm").isNotNull())
+
+    # Agrupar por municipio-año
+    key_cols = ["cod_municipio_norm", "year_icfes"]
+    agg_df = df.groupBy(*key_cols).agg(
+        F.round(F.avg("estrato_num"), 2).alias("prom_estrato_hogar"),
+        (F.sum("flag_internet_hogar") / F.count("*") * 100).alias("pct_internet_hogar"),
+        (F.sum("flag_edu_madre_superior") / F.count("*") * 100).alias("pct_educacion_madre_superior"),
+        (F.sum("flag_edu_padre_superior") / F.count("*") * 100).alias("pct_educacion_padre_superior"),
+        (F.sum("flag_privado") / F.count("*") * 100).alias("pct_colegio_privado"),
+        (F.sum("flag_urbano") / F.count("*") * 100).alias("pct_area_urbana"),
+        F.round(F.avg("personas_num"), 2).alias("promedio_personas_hogar"),
+        (F.sum("flag_computador") / F.count("*") * 100).alias("pct_hogar_computador"),
+        F.round(F.avg("punt_global"), 2).alias("puntaje_global_promedio"),
+        F.count("*").alias("n_estudiantes"),
+    )
+
+    # Renombrar year_icfes a year_int para consistencia
+    agg_df = agg_df.withColumnRenamed("year_icfes", "year_int")
+
+    return agg_df
 
 
 def summarize_print(name: str, df: DataFrame, show_rows: int = 20) -> None:
